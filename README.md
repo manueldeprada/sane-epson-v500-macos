@@ -50,23 +50,17 @@ python3 tools/v500scan.py --list   # preview and frame boxes only
 
 For each frame the tool scans a 6400 dpi color pass and a 3200 x 2400 dpi infrared pass (about
 3 minutes), removes dust, and writes `frameN_negative.tif` (16-bit linear, Deflate) and
-`frameN.heic` (10-bit sRGB, upright) to `scans/<date>_<time>/`. Cleaning runs at 6400 dpi. The
-stored files are then averaged 2 x 2 in linear light to 3200 dpi (about 57 MB per negative and 5 MB
-per HEIC; `--store-dpi 6400` keeps the full size). Frames are cleaned in worker processes while the
-scanner moves on to the next one. `--start N` continues the numbering for the next tray of a roll,
-`--raw-only` keeps the raw passes without cleaning, and `--from-raw DIR` cleans saved raw passes.
-It needs numpy, scipy, Pillow, and `swiftc` (builds `tiff2heic` on first use). The positive is a
-plain per-channel inversion with gray-world balance. Use the negative TIFF for a better conversion.
+`frameN.heic` (10-bit sRGB, upright) to `scans/<date>_<time>/`. Cleaning runs at 6400 dpi, then the
+files are averaged 2 x 2 to 3200 dpi (about 57 MB per negative, 5 MB per HEIC; `--store-dpi 6400`
+keeps the full size). It needs numpy, scipy, Pillow, and `swiftc` (builds `tiff2heic` on first use).
+The positive is a plain per-channel inversion with gray-world balance. Use the negative TIFF for a
+better conversion. `--start N` continues the numbering for the next tray, `--raw-only` keeps the raw
+passes without cleaning, and `--from-raw DIR` cleans saved raw passes.
 
-**Dust removal.** The infrared pass is not registered to the color pass, and the offset differs
-between scans: 13 rows on one 8 mm crop, -3 to +1 rows along one full frame, and 4 to 9 columns
-(6400 dpi pixels). A fixed correction in SANE or in a scanning app is therefore wrong.
-`tools/v500clean.py` measures the shift for each scan by correlating infrared dust with dark specks
-in the color image and fits a linear drift along the frame. It grows the mask by 4 pixels and fills
-each masked cell in two parts: a biharmonic interpolation of the surrounding pixels (edges continue
-across the hole, nothing is copied from elsewhere) plus film grain from a clean patch, limited to
-the grain amplitude measured around the hole. An earlier version copied whole patches and pasted
-dark pieces of the glasses frame into a face. It can run alone:
+**Dust removal.** The infrared pass is not registered to the color pass, and the offset changes
+between scans, so a fixed correction is wrong. `tools/v500clean.py` measures the shift per scan from
+the dust, masks it in the color image, and fills each hole with a biharmonic interpolation plus film
+grain from a clean patch of the same frame. It can run alone:
 `python3 tools/v500clean.py rgb.tif ir.tif cleaned.tif`.
 
 ## Limits
