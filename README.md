@@ -8,7 +8,7 @@ speak plain ESC/I on the USB bus. Epson's macOS ICA driver contains a library th
 loads that library from your own Epson install and sends the scanner's traffic through it. Nothing
 from Epson is included here.
 
-Tested on one V500 Photo, macOS 27, Apple Silicon. Nothing else is tested.
+Tested on one V500 Photo, macOS 27, Apple Silicon. Nothing else is tested. The strip tool was tested on one roll of color negatives (Kodak ColorPlus 200).
 
 ## Requirements
 
@@ -41,6 +41,27 @@ $scanimage -d epson2:libusb:000:007 --source "Transparency Unit" --film-type "Ne
 
 # infrared pass over the same area: --mode Infrared --depth 16 (800, 1600 or 3200 dpi)
 ```
+
+## Scan a film strip
+
+```bash
+python3 tools/v500scan.py          # preview, find the frames, scan, clean, convert
+python3 tools/v500scan.py --list   # preview and frame boxes only
+```
+
+For each frame the tool scans a 6400 dpi color pass and a 3200 x 2400 dpi infrared pass (about
+3 minutes), removes dust, and writes `frameN_negative.tif` (16-bit linear) and `frameN.heic`
+(10-bit sRGB, upright) to `scans/<date>_<time>/`. It needs numpy, scipy, Pillow, and `swiftc`
+(builds `tiff2heic` on first use). The positive is a plain per-channel inversion with gray-world
+balance. Use the negative TIFF for a better conversion.
+
+**Dust removal.** The infrared pass is not registered to the color pass, and the offset differs
+between scans: 13 rows on one 8 mm crop, -3 to +1 rows along one full frame, and 4 to 9 columns
+(6400 dpi pixels). A fixed correction in SANE or in a scanning app is therefore wrong. `tools/v500clean.py`
+measures the shift for each scan by correlating infrared dust with dark specks in the color image,
+fits a linear drift along the frame, grows the mask by 4 pixels, then fills each masked cell with the
+best-matching clean patch from the same frame and corrects the borders (Poisson). It can run alone:
+`python3 tools/v500clean.py rgb.tif ir.tif cleaned.tif`.
 
 ## Limits
 

@@ -2,3 +2,6 @@
 *.o
 interpreter-probe
 build/
+scans/
+tools/tiff2heic
+__pycache__/
