@@ -4,15 +4,20 @@
     v500clean.py rgb.tif ir.tif cleaned.tif [--mask mask.tif]
 
 The infrared image may have a different pixel grid than the RGB image (the V500 scans
-infrared at most at 3200 x 2400 dpi). The infrared dust map is built at its own resolution,
-registered to the RGB image by correlating it with dark residuals in the RGB luminance,
-then each masked region is filled with the best-matching clean patch from the same image
-and Poisson-corrected so that the borders blend. Needs numpy and scipy.
+infrared at most at 3200 x 2400 dpi). The infrared dust map is built at its own resolution
+and registered to the RGB image by correlating it with dark residuals in the RGB luminance.
+Each masked region is then filled in two parts: a biharmonic interpolation of the pixels around
+it (edges continue across the hole and no structure is invented), plus film grain taken from a
+clean patch with matching surroundings and limited to the grain amplitude measured around the
+hole. Needs numpy and scipy.
 """
 import argparse
+import os
 import struct
 import sys
 import time
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from scipy import ndimage as ndi
@@ -47,61 +52,88 @@ def read_tiff(path):
             raw = data[off:off + size]
         if typ in fmts:
             tags[tag] = struct.unpack('%s%d%s' % (e, cnt, fmts[typ]), raw)
-    if tags.get(259, (1,))[0] != 1:
-        raise ValueError('compressed TIFF is not supported')
+    compression = tags.get(259, (1,))[0]
+    if compression not in (1, 8, 32946):
+        raise ValueError('only uncompressed and Deflate TIFF are supported')
     w, h = tags[256][0], tags[257][0]
     bits = tags[258][0]
     spp = tags.get(277, (1,))[0]
+    predictor = tags.get(317, (1,))[0]
     offs, counts = tags[273], tags[279]
-    buf = b''.join(data[o:o + c] for o, c in zip(offs, counts))
+    parts = [data[o:o + c] for o, c in zip(offs, counts)]
+    if compression != 1:
+        parts = [zlib.decompress(p) for p in parts]
+    buf = b''.join(parts)
     if bits == 16:
         arr = np.frombuffer(buf, dtype=e + 'u2')[: w * h * spp]
         if e == '>':
             arr = arr.astype('<u2')
+        if predictor == 2:
+            arr = np.cumsum(arr.reshape(h, w, spp), axis=1, dtype=np.uint16).reshape(-1)
     else:
         arr = np.frombuffer(buf, dtype=np.uint8)[: w * h * spp]
+        if predictor == 2:
+            arr = np.cumsum(arr.reshape(h, w, spp), axis=1, dtype=np.uint8).reshape(-1)
     return arr.reshape(h, w, spp) if spp > 1 else arr.reshape(h, w)
 
 
-def write_tiff16(path, arr):
-    """Write a 16-bit gray or RGB uncompressed TIFF (single strip)."""
+def write_tiff16(path, arr, compress=True, rows_per_strip=64):
+    """Write a 16-bit gray or RGB TIFF. By default the strips are Deflate-compressed with the
+    horizontal predictor (lossless, about 30% smaller on film grain)."""
     arr = np.ascontiguousarray(arr.astype('<u2'))
     h, w = arr.shape[:2]
     spp = arr.shape[2] if arr.ndim == 3 else 1
-    pixel_bytes = arr.tobytes()
-    entries = []
-    bits_off = None
-    # layout: header(8) | pixel data | extra (bits array) | IFD
-    data_off = 8
-    extra_off = data_off + len(pixel_bytes)
+    img = arr.reshape(h, w, spp)
+    if not compress:
+        rows_per_strip = h
+    starts = list(range(0, h, rows_per_strip))
+
+    def encode(y0):
+        blk = img[y0:y0 + rows_per_strip]
+        if compress:
+            d = blk.copy()
+            d[:, 1:, :] = blk[:, 1:, :] - blk[:, :-1, :]
+            return zlib.compress(d.tobytes(), 6)
+        return blk.tobytes()
+
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+        strips = list(pool.map(encode, starts))
+    n = len(strips)
+    offsets, pos = [], 8
+    for st in strips:
+        offsets.append(pos)
+        pos += len(st) + (len(st) % 2)
     extra = b''
+    bits_off = pos
     if spp == 3:
-        bits_off = extra_off
         extra += struct.pack('<3H', 16, 16, 16)
-    ifd_off = extra_off + len(extra)
-    if ifd_off % 2:
-        extra += b'\0'
-        ifd_off += 1
+    offs_off = bits_off + len(extra)
+    counts_off = offs_off + 4 * n
+    ifd_off = counts_off + 4 * n
+    extra += struct.pack('<%dI' % n, *offsets) + struct.pack('<%dI' % n, *[len(x) for x in strips])
+    entries = []
 
     def ent(tag, typ, cnt, val):
         entries.append(struct.pack('<HHII', tag, typ, cnt, val))
 
     ent(256, 4, 1, w)
     ent(257, 4, 1, h)
-    if spp == 3:
-        ent(258, 3, 3, bits_off)
-    else:
-        ent(258, 3, 1, 16)
-    ent(259, 3, 1, 1)
+    ent(258, 3, spp if spp == 3 else 1, bits_off if spp == 3 else 16)
+    ent(259, 3, 1, 8 if compress else 1)
     ent(262, 3, 1, 2 if spp == 3 else 1)
-    ent(273, 4, 1, data_off)
+    ent(273, 4, n, offs_off if n > 1 else offsets[0])
     ent(277, 3, 1, spp)
-    ent(278, 4, 1, h)
-    ent(279, 4, 1, len(pixel_bytes))
+    ent(278, 4, 1, rows_per_strip)
+    ent(279, 4, n, counts_off if n > 1 else len(strips[0]))
     ent(284, 3, 1, 1)
+    if compress:
+        ent(317, 3, 1, 2)
     with open(path, 'wb') as f:
         f.write(b'II*\0' + struct.pack('<I', ifd_off))
-        f.write(pixel_bytes)
+        for st in strips:
+            f.write(st)
+            if len(st) % 2:
+                f.write(b'\0')
         f.write(extra)
         f.write(struct.pack('<H', len(entries)) + b''.join(entries) + struct.pack('<I', 0))
 
@@ -123,6 +155,40 @@ def estimate_registration(res, mask_y, mask_x, search_y, search_x):
             if v < best[0]:
                 best = (v, dy, dx)
     return best
+
+
+def biharmonic_base(out, known, ya, yb, xa, xb):
+    """Solve the biharmonic equation for every unknown pixel of the window [ya:yb, xa:xb] with the
+    known pixels as boundary data (edges continue across the hole with matching slope).
+    Returns (mask_of_unknowns, values) or None when the stencil leaves the window."""
+    h, w = yb - ya, xb - xa
+    unk = ~known[ya:yb, xa:xb]
+    if not unk.any():
+        return None
+    idx = -np.ones((h, w), np.int64)
+    n = int(unk.sum())
+    idx[unk] = np.arange(n)
+    uy, ux = np.nonzero(unk)
+    stencil = [((0, 0), 20.0), ((1, 0), -8.0), ((-1, 0), -8.0), ((0, 1), -8.0), ((0, -1), -8.0),
+               ((1, 1), 2.0), ((1, -1), 2.0), ((-1, 1), 2.0), ((-1, -1), 2.0),
+               ((2, 0), 1.0), ((-2, 0), 1.0), ((0, 2), 1.0), ((0, -2), 1.0)]
+    rows, cols, vals = [], [], []
+    rhs = np.zeros((n, 3), np.float64)
+    for (dy, dx), c in stencil:
+        qy, qx = uy + dy, ux + dx
+        if (qy < 0).any() or (qy >= h).any() or (qx < 0).any() or (qx >= w).any():
+            return None
+        j = idx[qy, qx]
+        isu = j >= 0
+        rows.append(np.nonzero(isu)[0]); cols.append(j[isu]); vals.append(np.full(int(isu.sum()), c))
+        kn = ~isu
+        rhs[kn] -= c * out[qy[kn] + ya, qx[kn] + xa]
+    A = sparse.csc_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(n, n))
+    return unk, splu(A).solve(rhs)
+
+
+GRAIN_SIGMA = 3.0
+BIHARMONIC = True
 
 
 def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log=print):
@@ -253,10 +319,7 @@ def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log
         diff = out[cyc, cxc] - out[ry, rx][None, :, :]
         cost = (diff ** 2).sum((1, 2))
         cost[~valid] = np.inf
-        k = int(np.argmin(cost))
-        dy, dx = int(dys[k]), int(dxs[k])
-
-        # Poisson correction on a local window
+        # 1. smooth base: harmonic interpolation of the ring (no structure is invented)
         h, w = yb - ya, xb - xa
         idx = -np.ones((h, w), np.int64)
         n = len(Ry)
@@ -276,17 +339,49 @@ def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log
             cols.append(idx[qyc, qxc][inR])
             vals.append(-np.ones(inR.sum()))
             bi = np.nonzero(isb)[0]
-            gy, gx = qyc[bi] + ya, qxc[bi] + xa
-            sy2, sx2 = gy + dy, gx + dx
-            good = (sy2 >= 0) & (sy2 < H) & (sx2 >= 0) & (sx2 < W)
-            bgood = bi[good]
-            rhs[bgood] += out[gy[good], gx[good]] - out[sy2[good], sx2[good]]
-            deg[np.setdiff1d(bi, bgood)] -= 1
+            rhs[bi] += out[qyc[bi] + ya, qxc[bi] + xa]
         deg = np.maximum(deg, 1)
         rows.append(np.arange(n)); cols.append(np.arange(n)); vals.append(deg)
         A = sparse.csc_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(n, n))
-        corr = splu(A).solve(rhs)
-        out[Ry, Rx] = out[Ry + dy, Rx + dx] + corr
+        base = splu(A).solve(rhs)
+        if BIHARMONIC:
+            ya2, yb2 = max(0, y0 - 14), min(H, y1 + 14)
+            xa2, xb2 = max(0, x0 - 14), min(W, x1 + 14)
+            bh = biharmonic_base(out, known, ya2, yb2, xa2, xb2)
+            if bh is not None:
+                unk_mask, vals_bh = bh
+                lut = -np.ones(unk_mask.shape, np.int64)
+                lut[unk_mask] = np.arange(int(unk_mask.sum()))
+                base = vals_bh[lut[Ry - ya2, Rx - xa2]]
+
+        # 2. grain: the high-pass detail of a clean patch whose surroundings match, limited to the grain
+        #    amplitude measured around the hole, so no speck or edge can be pasted in
+        win = out[ya:yb, xa:xb]
+        kf = kn_loc.astype(np.float32)
+        den = np.maximum(ndi.gaussian_filter(kf, GRAIN_SIGMA), 1e-3)
+        blur_t = np.stack([ndi.gaussian_filter(win[..., c] * kf, GRAIN_SIGMA) for c in range(3)], -1) / den[..., None]
+        hp_t = (win - blur_t)[ringm]
+        sig = 1.4826 * np.median(np.abs(hp_t - np.median(hp_t, axis=0)), axis=0) + 1.0
+        detail = np.zeros_like(base)
+        for kk in np.argsort(cost)[:25]:
+            if not np.isfinite(cost[kk]):
+                break
+            dy, dx = int(dys[kk]), int(dxs[kk])
+            sya, syb = max(0, ya + dy), min(H, yb + dy)
+            sxa, sxb = max(0, xa + dx), min(W, xb + dx)
+            if (syb - sya, sxb - sxa) != (h, w):
+                continue
+            swin = out[sya:syb, sxa:sxb]
+            skn = known[sya:syb, sxa:sxb].astype(np.float32)
+            sden = np.maximum(ndi.gaussian_filter(skn, GRAIN_SIGMA), 1e-3)
+            blur_s = np.stack([ndi.gaussian_filter(swin[..., c] * skn, GRAIN_SIGMA) for c in range(3)], -1) / sden[..., None]
+            hp_s = (swin - blur_s)[ly, lx]
+            if (np.abs(hp_s) > 4 * sig).mean() <= 0.02:
+                detail = np.clip(hp_s, -3 * sig, 3 * sig)
+                break
+        rv = out[ry, rx]
+        m = 0.25 * (rv.max(0) - rv.min(0)) + 300.0
+        out[Ry, Rx] = np.clip(base + detail, rv.min(0) - m, rv.max(0) + m)
         known[Ry, Rx] = True
         if (ci + 1) % 500 == 0:
             log('  filled %d / %d cells (%.0fs)' % (ci + 1, len(cells), time.time() - t0))

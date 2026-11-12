@@ -7,9 +7,12 @@
 
 For each frame: a 6400 dpi 16-bit linear RGB pass and a 3200 x 2400 dpi infrared pass, dust
 removal from the infrared pass (v500clean.py), then
-    frameN_negative.tif   cleaned 16-bit linear negative (input for Negative Lab Pro or similar)
-    frameN.heic           10-bit sRGB positive, upright (negpos.py)
-Raw passes are deleted unless --keep-raw is given.
+    frameN_negative.tif   cleaned 16-bit linear negative at 3200 dpi, Deflate (input for Negative Lab Pro or similar)
+    frameN.heic           10-bit sRGB positive at 3200 dpi, upright (negpos.py)
+Both are the 6400 dpi scan averaged 2 x 2 in linear light after cleaning (--store-dpi 6400 keeps the
+full size). Frames are cleaned in worker processes while the scanner moves on to the next one.
+Raw passes are deleted unless --keep-raw is given. --raw-only skips the cleaning, --from-raw DIR
+cleans saved raw passes, and --start N continues the numbering for the next tray of a roll.
 
 Needs the patched SANE build (scripts/build-sane.sh), numpy, scipy, Pillow, and swiftc (to build
 tiff2heic once). Set V500_SANE_PREFIX if SANE is not in ~/.local/sane-epson-v500 and V500_OUT to
@@ -35,6 +38,7 @@ import v500clean         # noqa: E402
 SANE_PREFIX = os.environ.get('V500_SANE_PREFIX', os.path.expanduser('~/.local/sane-epson-v500'))
 OUT_ROOT = os.environ.get('V500_OUT', os.path.join(os.getcwd(), 'scans'))
 RGB_DPI = 6400
+STORE_DPI = 3200               # stored negative and HEIC: 6400 averaged 2 x 2 in linear light (3200) or kept (6400)
 IR_DPI = 3200
 PREVIEW_DPI = 200
 TPU_MM = (68.5, 236.9)          # usable transparency area (width, height), slightly inside 68.58 x 236.98
@@ -172,20 +176,37 @@ def save_preview(prev, frames, path):
 
 
 # ---------------------------------------------------------------- per-frame processing
-def process_frame(n, rgb_path, ir_path, out_neg, out_heic, keep_raw):
+def halve(a):
+    """Average 2 x 2 pixels of a uint16 image (the negative is linear, so this is a linear-light average)."""
+    h, w = a.shape[0] // 2 * 2, a.shape[1] // 2 * 2
+    a = a[:h, :w]
+    acc = a[0::2, 0::2].astype(np.uint32)
+    acc += a[1::2, 0::2]
+    acc += a[0::2, 1::2]
+    acc += a[1::2, 1::2]
+    return ((acc + 2) >> 2).astype(np.uint16)
+
+
+def process_frame(n, rgb_path, ir_path, out_neg, out_heic, keep_raw, store_dpi=None):
     """Runs in a worker process while the scanner moves on to the next frame."""
     t0 = time.time()
     lines = []
     log = lambda m: lines.append(m)
+    store_dpi = store_dpi or STORE_DPI
     rgb = v500clean.read_tiff(rgb_path)
     ir = v500clean.read_tiff(ir_path)
     cleaned, mask, _ = v500clean.clean(rgb, ir, log=log)
     del rgb
+    crop = negpos.CROP
+    if store_dpi != RGB_DPI:
+        cleaned = halve(cleaned)
+        crop = negpos.CROP // 2
+        log('stored at %d dpi (2 x 2 average of the %d dpi scan)' % (RGB_DPI // 2, RGB_DPI))
     v500clean.write_tiff16(out_neg, cleaned)
-    pos = negpos.convert(cleaned, log=log)
+    pos = negpos.convert(cleaned, crop=crop, log=log)
     del cleaned
     tmp = out_heic + '.tmp.tif'
-    v500clean.write_tiff16(tmp, pos)
+    v500clean.write_tiff16(tmp, pos, compress=False)
     del pos
     subprocess.run([heic_tool(), tmp, out_heic, '0.9'], check=True, capture_output=True)
     os.remove(tmp)
@@ -216,10 +237,33 @@ def main():
     ap.add_argument('--list', action='store_true', help='preview and detect frames, then stop')
     ap.add_argument('--only', help='comma-separated frame numbers to scan, for example 2,3')
     ap.add_argument('--keep-raw', action='store_true', help='keep the raw RGB and infrared TIFFs')
+    ap.add_argument('--raw-only', action='store_true', help='scan and keep the raw passes, skip cleaning and conversion')
+    ap.add_argument('--from-raw', metavar='DIR', help='clean and convert the raw passes (frameN_rgb_raw.tif, frameN_ir_raw.tif) found in DIR instead of scanning')
+    ap.add_argument('--store-dpi', type=int, choices=(3200, 6400), default=STORE_DPI, help='resolution of the stored negative and HEIC (default %d)' % STORE_DPI)
+    ap.add_argument('--start', type=int, default=1, help='number of the first frame, to continue the numbering across trays of one roll')
+    ap.add_argument('--workers', type=int, default=2, help='frames cleaned at the same time while the scanner moves on (default 2)')
     ap.add_argument('--film-type', default=FILM_TYPE)
     ap.add_argument('--frames', help='manual areas in mm as x,y,w,h;x,y,w,h (skips detection)')
     a = ap.parse_args()
     FILM_TYPE = a.film_type
+
+    if a.from_raw:
+        src = os.path.abspath(a.from_raw)
+        out = os.path.abspath(a.out or src)
+        os.makedirs(out, exist_ok=True)
+        heic_tool()
+        nums = sorted(int(m.group(1)) for f in os.listdir(src) for m in [re.match(r'frame(\d+)_rgb_raw\.tif$', f)] if m)
+        if a.only:
+            nums = [n for n in nums if n in {int(v) for v in a.only.split(',')}]
+        for n in nums:
+            say('frame %d ...' % n)
+            _, lines = process_frame(
+                n, os.path.join(src, 'frame%d_rgb_raw.tif' % n), os.path.join(src, 'frame%d_ir_raw.tif' % n),
+                os.path.join(out, 'frame%d_negative.tif' % n), os.path.join(out, 'frame%d.heic' % n), True, a.store_dpi)
+            for l in lines:
+                say('  ' + l)
+        say('done: %s' % out)
+        return
 
     out = a.out or os.path.join(OUT_ROOT, datetime.datetime.now().strftime('%Y-%m-%d_%H%M'))
     out = os.path.abspath(out)
@@ -259,10 +303,10 @@ def main():
         frames = [f for f in frames if f['n'] in wanted]
 
     # scan each frame; clean the previous one in a worker while the next is scanning
-    pool = cf.ProcessPoolExecutor(max_workers=1, mp_context=__import__('multiprocessing').get_context('spawn'))
+    pool = cf.ProcessPoolExecutor(max_workers=max(1, a.workers), mp_context=__import__('multiprocessing').get_context('spawn'))
     futures = []
     for f in frames:
-        n = f['n']
+        n = f['n'] + a.start - 1
         say('frame %d: RGB %d dpi ...' % (n, RGB_DPI))
         area = ['-l', '%.2f' % f['x_mm'], '-t', '%.2f' % f['y_mm'], '-x', '%.2f' % f['w_mm'], '-y', '%.2f' % f['h_mm']]
         rgb_path = os.path.join(out, 'frame%d_rgb_raw.tif' % n)
@@ -271,10 +315,13 @@ def main():
                        '--resolution', str(RGB_DPI)] + area, rgb_path)
         say('  RGB %.0fs; infrared %d dpi ...' % (dt, IR_DPI))
         dt = run_scan(['--mode', 'Infrared', '--depth', '16', '--resolution', str(IR_DPI)] + area, ir_path)
+        if a.raw_only:
+            say('  infrared %.0fs; raw passes kept' % dt)
+            continue
         say('  infrared %.0fs; cleaning in the background' % dt)
         futures.append(pool.submit(
             process_frame, n, rgb_path, ir_path,
-            os.path.join(out, 'frame%d_negative.tif' % n), os.path.join(out, 'frame%d.heic' % n), a.keep_raw))
+            os.path.join(out, 'frame%d_negative.tif' % n), os.path.join(out, 'frame%d.heic' % n), a.keep_raw, a.store_dpi))
         for fut in [x for x in futures if x.done()]:
             futures.remove(fut)
             report(fut)
