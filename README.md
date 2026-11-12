@@ -1,6 +1,6 @@
 # sane-epson-v500-macos
 
-A patch that lets SANE scan film with the Epson Perfection V500 Photo on macOS, including a separate
+A patch that lets SANE scan film with the Epson Perfection V500 Photo on macOS, with a separate
 infrared pass for dust detection.
 
 Stock SANE cannot open this scanner (USB `04b8:0130`, reported as `GT-X770`), because it does not
@@ -8,7 +8,7 @@ speak plain ESC/I on the USB bus. Epson's macOS ICA driver contains a library th
 loads that library from your own Epson install and sends the scanner's traffic through it. Nothing
 from Epson is included here.
 
-Tested on one V500 Photo, macOS 27, Apple Silicon. Nothing else is tested. The strip tool was tested on one roll of color negatives (Kodak ColorPlus 200).
+Tested on a V500 Photo on macOS 27, Apple Silicon.
 
 ## Requirements
 
@@ -26,7 +26,6 @@ existing SANE install alone. To check the driver library and scanner without SAN
 `tools/interpreter-probe.c` (instructions in the file).
 
 ## Use
-
 
 ```bash
 export SANE_CONFIG_DIR=~/.local/sane-epson-v500/etc/sane.d
@@ -55,13 +54,10 @@ For each frame the tool scans a 6400 dpi color pass and a 3200 x 2400 dpi infrar
 (builds `tiff2heic` on first use). The positive is a plain per-channel inversion with gray-world
 balance. Use the negative TIFF for a better conversion.
 
-**Dust removal.** The infrared pass is not registered to the color pass, and the offset differs
-between scans: 13 rows on one 8 mm crop, -3 to +1 rows along one full frame, and 4 to 9 columns
-(6400 dpi pixels). A fixed correction in SANE or in a scanning app is therefore wrong. `tools/v500clean.py`
-measures the shift for each scan by correlating infrared dust with dark specks in the color image,
-fits a linear drift along the frame, grows the mask by 4 pixels, then fills each masked cell with the
-best-matching clean patch from the same frame and corrects the borders (Poisson). It can run alone:
-`python3 tools/v500clean.py rgb.tif ir.tif cleaned.tif`.
+**Dust removal.** The infrared pass is not registered to the color pass, and the offset changes
+between scans, so a fixed correction is wrong. `tools/v500clean.py` measures the shift per scan from
+the dust, masks it in the color image, and fills the mask from clean patches of the same frame. It
+can run alone: `python3 tools/v500clean.py rgb.tif ir.tif cleaned.tif`.
 
 ## Limits
 
