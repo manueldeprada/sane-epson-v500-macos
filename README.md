@@ -27,7 +27,6 @@ existing SANE install alone. To check the driver library and scanner without SAN
 
 ## Use
 
-Close VueScan and Image Capture first, because they hold the scanner exclusively.
 
 ```bash
 export SANE_CONFIG_DIR=~/.local/sane-epson-v500/etc/sane.d
@@ -49,15 +48,8 @@ $scanimage -d epson2:libusb:000:007 --source "Transparency Unit" --film-type "Ne
 - Infrared works at 800, 1600 and 3200 dpi (3200 x 2400 pixels per inch) and returns one gray frame.
   Other color resolutions need the infrared frame resampled by the caller.
 - Negative Film compensates the orange mask but does not invert.
-- An aborted scan can leave the scanner unresponsive. Power-cycle it.
 
 Details of the library interface are in [docs/INTERFACE.md](docs/INTERFACE.md).
-
-## Legal
-
-Not affiliated with Seiko Epson Corporation. The calling convention was found by running Epson's
-library and reading its exported symbols and disassembly. Check the rules that apply to you and the
-license of Epson's driver. No warranty.
 
 ## License
 
