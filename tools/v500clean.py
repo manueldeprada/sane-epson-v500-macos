@@ -157,21 +157,34 @@ def estimate_registration(res, mask_y, mask_x, search_y, search_x):
     return best
 
 
-def biharmonic_base(out, known, ya, yb, xa, xb):
-    """Solve the biharmonic equation for every unknown pixel of the window [ya:yb, xa:xb] with the
-    known pixels as boundary data (edges continue across the hole with matching slope).
-    Returns (mask_of_unknowns, values) or None when the stencil leaves the window."""
+def diffusion_base(out, known, ya, yb, xa, xb, order=2, target=None):
+    """Solve the harmonic (order 1) or biharmonic (order 2) equation for every unknown pixel of the
+    window [ya:yb, xa:xb] with the known pixels as boundary data. The biharmonic solution continues
+    edges across the hole with matching slope but can overshoot, the harmonic one never leaves the
+    range of its boundary. Returns (mask_of_unknowns, values) or None when the stencil leaves the
+    window."""
     h, w = yb - ya, xb - xa
     unk = ~known[ya:yb, xa:xb]
+    if target is not None:
+        # unfilled pixels of other regions that sit near the window border keep their current values
+        # as boundary data; the stencil would otherwise reach outside the window
+        band = np.ones((h, w), bool)
+        band[2:-2, 2:-2] = False
+        if (target & band).any():
+            return None
+        unk = unk & ~band
     if not unk.any():
         return None
     idx = -np.ones((h, w), np.int64)
     n = int(unk.sum())
     idx[unk] = np.arange(n)
     uy, ux = np.nonzero(unk)
-    stencil = [((0, 0), 20.0), ((1, 0), -8.0), ((-1, 0), -8.0), ((0, 1), -8.0), ((0, -1), -8.0),
-               ((1, 1), 2.0), ((1, -1), 2.0), ((-1, 1), 2.0), ((-1, -1), 2.0),
-               ((2, 0), 1.0), ((-2, 0), 1.0), ((0, 2), 1.0), ((0, -2), 1.0)]
+    if order == 1:
+        stencil = [((0, 0), 4.0), ((1, 0), -1.0), ((-1, 0), -1.0), ((0, 1), -1.0), ((0, -1), -1.0)]
+    else:
+        stencil = [((0, 0), 20.0), ((1, 0), -8.0), ((-1, 0), -8.0), ((0, 1), -8.0), ((0, -1), -8.0),
+                   ((1, 1), 2.0), ((1, -1), 2.0), ((-1, 1), 2.0), ((-1, -1), 2.0),
+                   ((2, 0), 1.0), ((-2, 0), 1.0), ((0, 2), 1.0), ((0, -2), 1.0)]
     rows, cols, vals = [], [], []
     rhs = np.zeros((n, 3), np.float64)
     for (dy, dx), c in stencil:
@@ -188,10 +201,12 @@ def biharmonic_base(out, known, ya, yb, xa, xb):
 
 
 GRAIN_SIGMA = 3.0
-BIHARMONIC = True
+BIH_LIMIT = 0.15
 
 
-def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log=print):
+def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log=print,
+          strong_sigma=15.0, grow_strong=9, regrow=False, regrow_k=2.5, regrow_dist=12,
+          local_reg=False, local_reg_range=4, local_reg_min_px=150, low_sigma=2.5, visible_min=None, grain=True, final_clip=True):
     H, W = rgb.shape[:2]
     rgb = rgb.astype(np.float32)
     ir = ir.astype(np.float32)
@@ -201,7 +216,18 @@ def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log
     t0 = time.time()
     dm = ndi.median_filter(ir, size=7) - ir
     sig = 1.4826 * np.median(np.abs(dm - np.median(dm)))
-    m_native = ndi.binary_dilation(dm > thr * sig, iterations=1)
+    strong_core = dm > thr * sig
+    if low_sigma is not None:
+        # hysteresis: weaker pixels count when they are connected to a strong core, which bridges the
+        # gaps where a fiber crosses an image edge and its infrared contrast dips
+        low = dm > low_sigma * sig
+        lab, nlab = ndi.label(low, structure=np.ones((3, 3)))
+        keep = np.zeros(nlab + 1, bool)
+        keep[np.unique(lab[strong_core])] = True
+        keep[0] = False
+        strong_core = keep[lab]
+        del lab
+    m_native = ndi.binary_dilation(strong_core, iterations=1)
     log('infrared mask: %d px at %dx%d (%.1fs)' % (m_native.sum(), ir.shape[1], ir.shape[0], time.time() - t0))
     ys, xs = np.nonzero(m_native)
     # mask coordinates on the RGB grid (centers of the infrared pixels)
@@ -248,25 +274,77 @@ def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log
     else:
         log('registration forced: dy,dx = %d,%d' % shift)
         reg = lambda y: (np.full_like(y, shift[0]), np.full_like(y, shift[1]))
-    del res
 
-    # mask on the RGB grid, shifted to the RGB features
-    mask = np.zeros((H, W), bool)
-    up = ndi.zoom(m_native.astype(np.float32), (sy, sx), order=1)
-    up = up[:H, :W] > 0.3
-    if up.shape != (H, W):
-        tmp = np.zeros((H, W), bool)
-        tmp[:up.shape[0], :up.shape[1]] = up
-        up = tmp
-    mask = np.zeros((H, W), bool)
-    yy, xx = np.nonzero(up)
-    dyr, dxr = reg(yy)
-    yy = yy - dyr
-    xx = xx - dxr
-    ok = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W)
-    mask[yy[ok], xx[ok]] = True
-    del up
-    omega = ndi.binary_dilation(ndi.binary_dilation(mask, iterations=grow), iterations=1)
+    # masks on the RGB grid, shifted to the RGB features. Strong infrared dust (an opaque fiber or
+    # speck) scatters light around itself, so its halo is wider than its infrared footprint and gets
+    # a wider mask than weak dust.
+    def to_rgb_grid(m_ir, per_component=False):
+        if not per_component:
+            up = ndi.zoom(m_ir.astype(np.float32), (sy, sx), order=1)[:H, :W] > 0.3
+            out_mask = np.zeros((H, W), bool)
+            yy, xx = np.nonzero(up)
+            dyr, dxr = reg(yy)
+            out_mask[np.clip(yy - dyr, 0, H - 1), np.clip(xx - dxr, 0, W - 1)] = True
+            return out_mask
+        # each large component is re-registered on its own within a few pixels of the fitted model
+        lab, n = ndi.label(m_ir, structure=np.ones((3, 3)))
+        labup = ndi.zoom(lab.astype(np.int32), (sy, sx), order=0)[:H, :W]
+        out_mask = np.zeros((H, W), bool)
+        moved = 0
+        for k, sl in enumerate(ndi.find_objects(labup), 1):
+            if sl is None:
+                continue
+            yy, xx = np.nonzero(labup[sl] == k)
+            yy = yy + sl[0].start
+            xx = xx + sl[1].start
+            dyr, dxr = reg(yy)
+            by, bx = yy - dyr, xx - dxr
+            dyk = dxk = 0
+            if len(yy) >= local_reg_min_px:
+                step = max(1, len(yy) // 2000)
+                py, px = by[::step], bx[::step]
+                best_v, best, v0 = None, (0, 0), np.inf
+                for ddy in range(-local_reg_range, local_reg_range + 1):
+                    for ddx in range(-local_reg_range, local_reg_range + 1):
+                        qy, qx = py - ddy, px - ddx
+                        ok = (qy >= 0) & (qy < H) & (qx >= 0) & (qx < W)
+                        if ok.sum() < 20:
+                            continue
+                        val = float(res[qy[ok], qx[ok]].mean())
+                        if ddy == 0 and ddx == 0:
+                            v0 = val
+                        if best_v is None or val < best_v:
+                            best_v, best = val, (ddy, ddx)
+                if best_v is not None and best_v < v0 - 0.15:
+                    dyk, dxk = best
+                    moved += 1
+            out_mask[np.clip(by - dyk, 0, H - 1), np.clip(bx - dxk, 0, W - 1)] = True
+        log('local re-registration moved %d large components' % moved)
+        return out_mask
+
+    mask = to_rgb_grid(m_native, per_component=local_reg)
+    if regrow:
+        # region growing: from the registered infrared mask into neighbors that are darker in the
+        # negative than their surroundings (the halo of a dust particle), at most regrow_dist pixels out
+        lum = rgb.mean(2)
+        known0 = ~ndi.binary_dilation(mask, iterations=6)
+        kf = known0.astype(np.float32)
+        ref = ndi.gaussian_filter(lum * kf, 10) / np.maximum(ndi.gaussian_filter(kf, 10), 1e-3)
+        rr = ndi.gaussian_filter(lum - ref, 1.0)
+        sample = rr[::7, ::7][known0[::7, ::7]]
+        sig_n = 1.4826 * np.median(np.abs(sample - np.median(sample)))
+        near = ndi.binary_dilation(mask, structure=np.ones((3, 3), bool), iterations=regrow_dist)
+        cand = (rr < -regrow_k * sig_n) & near
+        before = int(mask.sum())
+        mask = ndi.binary_propagation(mask, mask=cand | mask, structure=np.ones((3, 3), bool))
+        log('region growing: mask %d -> %d px' % (before, int(mask.sum())))
+        del lum, ref, rr, cand, near
+    del res
+    omega = ndi.binary_dilation(mask, iterations=grow)
+    m_strong = ndi.binary_dilation(dm > strong_sigma * sig, iterations=1)
+    if m_strong.any():
+        omega |= ndi.binary_dilation(to_rgb_grid(m_strong), iterations=grow_strong)
+    omega = ndi.binary_dilation(omega, iterations=1)
     log('unknown region: %.2f%% of the frame' % (100 * omega.mean()))
 
     out = rgb
@@ -276,6 +354,93 @@ def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log
     dxs = rng.integers(-220, 221, ncand * 3)
     far = (np.abs(dys) + np.abs(dxs)) > 14
     dys, dxs = dys[far][:ncand], dxs[far][:ncand]
+
+    # grain level of flat areas, measured once per frame: grain is only transferred at this amplitude
+    # (near an edge the local high-pass is dominated by the edge, and copying it makes visible blocks)
+    rng_g = np.random.default_rng(3)
+    blocks = []
+    for _ in range(24):
+        y0b = int(rng_g.integers(0, max(1, H - 160))); x0b = int(rng_g.integers(0, max(1, W - 160)))
+        blk = rgb[y0b:y0b + 160, x0b:x0b + 160]
+        hpb = np.stack([blk[..., c] - ndi.gaussian_filter(blk[..., c], GRAIN_SIGMA) for c in range(3)], -1)
+        blocks.append(1.4826 * np.median(np.abs(hpb - np.median(hpb, axis=(0, 1))), axis=(0, 1)))
+    sig_global = np.median(np.array(blocks), axis=0) + 1.0
+    log('grain level (counts): %s' % np.round(sig_global, 0))
+
+    # pass 1: smooth base. Each connected dust region is solved as one biharmonic problem so that no
+    # tile seams appear (very large regions are cut into 96 px blocks). Edges continue across the hole
+    # and nothing is copied from elsewhere.
+    t1 = time.time()
+    kb = known.copy()
+    skipped = []
+    lab, nlab = ndi.label(omega, structure=np.ones((3, 3), bool))
+    for k, sl in enumerate(ndi.find_objects(lab), 1):
+        if sl is None:
+            continue
+        comp_full = lab[sl] == k
+        regions = []
+        if int(comp_full.sum()) <= 40000:
+            ya, yb = max(0, sl[0].start - 14), min(H, sl[0].stop + 14)
+            xa, xb = max(0, sl[1].start - 14), min(W, sl[1].stop + 14)
+            comp = np.zeros((yb - ya, xb - xa), bool)
+            comp[sl[0].start - ya:sl[0].stop - ya, sl[1].start - xa:sl[1].stop - xa] = comp_full
+            regions.append((ya, yb, xa, xb, comp))
+        else:
+            for ty in range(sl[0].start, sl[0].stop, 96):
+                for tx in range(sl[1].start, sl[1].stop, 96):
+                    ya, yb = max(0, ty - 14), min(H, ty + 96 + 14)
+                    xa, xb = max(0, tx - 14), min(W, tx + 96 + 14)
+                    comp = lab[ya:yb, xa:xb] == k
+                    inside = np.zeros_like(comp)
+                    inside[ty - ya:ty + 96 - ya, tx - xa:tx + 96 - xa] = True
+                    regions.append((ya, yb, xa, xb, comp & inside))
+        for ya, yb, xa, xb, comp in regions:
+            if not comp.any():
+                continue
+            wk = kb[ya:yb, xa:xb]
+            sol2 = diffusion_base(out, kb, ya, yb, xa, xb, order=2, target=comp)
+            sol1 = diffusion_base(out, kb, ya, yb, xa, xb, order=1, target=comp)
+            tgt = out[ya:yb, xa:xb]
+            if sol1 is not None and sol2 is not None:
+                unk_mask, v1 = sol1
+                _, v2 = sol2
+                lut = -np.ones(unk_mask.shape, np.int64)
+                lut[unk_mask] = np.arange(int(unk_mask.sum()))
+                # the biharmonic solution may differ from the harmonic one by at most a fraction of the
+                # contrast around the region, which keeps edges continuing without dark or bright blocks
+                ring_c = ndi.binary_dilation(comp, iterations=3) & ~comp & wk
+                rv_c = tgt[ring_c]
+                if len(rv_c):
+                    tau = BIH_LIMIT * (np.percentile(rv_c, 95, axis=0) - np.percentile(rv_c, 5, axis=0)) + 150.0
+                else:
+                    tau = np.full(3, 150.0)
+                i1 = lut[comp]
+                orig = tgt[comp].copy()
+                new_vals = v1[i1] + np.clip(v2[i1] - v1[i1], -tau, tau)
+                if visible_min is not None:
+                    # visibility gate: leave the region alone when the color image deviates from what its
+                    # surroundings predict by no more than the grain does (the infrared flagged something
+                    # that is not visible, for example the edge of an eyelid)
+                    core = mask[ya:yb, xa:xb][comp]
+                    if core.sum() >= 8:
+                        kn_win = tgt[wk]
+                        gx = np.abs(np.diff(tgt, axis=1))[wk[:, 1:] & wk[:, :-1]]
+                        sig_g = 1.4826 * np.median(gx, axis=0) / np.sqrt(2) + 1.0 if len(gx) else np.full(3, 300.0)
+                        score = float((np.abs(orig - new_vals)[core] / sig_g).mean())
+                        if score < visible_min:
+                            skipped.append((ya, yb, xa, xb, comp))
+                            continue
+                tgt[comp] = new_vals
+            else:
+                # window touches the image border: copy the nearest known pixel
+                idx_near = ndi.distance_transform_edt(~wk, return_distances=False, return_indices=True)
+                tgt[comp] = tgt[idx_near[0][comp], idx_near[1][comp]]
+            kb[ya:yb, xa:xb][comp] = True
+    del kb, lab
+    for ya, yb, xa, xb, comp in skipped:
+        omega[ya:yb, xa:xb][comp] = False
+        known[ya:yb, xa:xb][comp] = True
+    log('smooth base: %.0fs (%d regions left alone because they are not visible in the color image)' % (time.time() - t1, len(skipped)))
 
     oy_, ox_ = np.nonzero(omega)
     cells = np.unique((oy_ // cell) * (W // cell + 2) + (ox_ // cell))
@@ -319,40 +484,9 @@ def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log
         diff = out[cyc, cxc] - out[ry, rx][None, :, :]
         cost = (diff ** 2).sum((1, 2))
         cost[~valid] = np.inf
-        # 1. smooth base: harmonic interpolation of the ring (no structure is invented)
         h, w = yb - ya, xb - xa
-        idx = -np.ones((h, w), np.int64)
-        n = len(Ry)
         ly, lx = Ry - ya, Rx - xa
-        idx[ly, lx] = np.arange(n)
-        rows, cols, vals = [], [], []
-        rhs = np.zeros((n, 3), np.float64)
-        deg = np.zeros(n)
-        for ddy, ddx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            qy, qx = ly + ddy, lx + ddx
-            inw = (qy >= 0) & (qy < h) & (qx >= 0) & (qx < w)
-            qyc, qxc = np.clip(qy, 0, h - 1), np.clip(qx, 0, w - 1)
-            inR = inw & (idx[qyc, qxc] >= 0)
-            isb = inw & ~inR & kn_loc[qyc, qxc]
-            deg += inR + isb
-            rows.append(np.nonzero(inR)[0])
-            cols.append(idx[qyc, qxc][inR])
-            vals.append(-np.ones(inR.sum()))
-            bi = np.nonzero(isb)[0]
-            rhs[bi] += out[qyc[bi] + ya, qxc[bi] + xa]
-        deg = np.maximum(deg, 1)
-        rows.append(np.arange(n)); cols.append(np.arange(n)); vals.append(deg)
-        A = sparse.csc_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(n, n))
-        base = splu(A).solve(rhs)
-        if BIHARMONIC:
-            ya2, yb2 = max(0, y0 - 14), min(H, y1 + 14)
-            xa2, xb2 = max(0, x0 - 14), min(W, x1 + 14)
-            bh = biharmonic_base(out, known, ya2, yb2, xa2, xb2)
-            if bh is not None:
-                unk_mask, vals_bh = bh
-                lut = -np.ones(unk_mask.shape, np.int64)
-                lut[unk_mask] = np.arange(int(unk_mask.sum()))
-                base = vals_bh[lut[Ry - ya2, Rx - xa2]]
+        base = out[Ry, Rx].copy()
 
         # 2. grain: the high-pass detail of a clean patch whose surroundings match, limited to the grain
         #    amplitude measured around the hole, so no speck or edge can be pasted in
@@ -361,9 +495,9 @@ def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log
         den = np.maximum(ndi.gaussian_filter(kf, GRAIN_SIGMA), 1e-3)
         blur_t = np.stack([ndi.gaussian_filter(win[..., c] * kf, GRAIN_SIGMA) for c in range(3)], -1) / den[..., None]
         hp_t = (win - blur_t)[ringm]
-        sig = 1.4826 * np.median(np.abs(hp_t - np.median(hp_t, axis=0)), axis=0) + 1.0
+        sig = sig_global
         detail = np.zeros_like(base)
-        for kk in np.argsort(cost)[:25]:
+        for kk in (np.argsort(cost)[:25] if grain else []):
             if not np.isfinite(cost[kk]):
                 break
             dy, dx = int(dys[kk]), int(dxs[kk])
@@ -381,7 +515,7 @@ def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log
                 break
         rv = out[ry, rx]
         m = 0.25 * (rv.max(0) - rv.min(0)) + 300.0
-        out[Ry, Rx] = np.clip(base + detail, rv.min(0) - m, rv.max(0) + m)
+        out[Ry, Rx] = np.clip(base + detail, rv.min(0) - m, rv.max(0) + m) if final_clip else base + detail
         known[Ry, Rx] = True
         if (ci + 1) % 500 == 0:
             log('  filled %d / %d cells (%.0fs)' % (ci + 1, len(cells), time.time() - t0))

@@ -55,12 +55,14 @@ files are averaged 2 x 2 to 3200 dpi (about 57 MB per negative, 5 MB per HEIC; `
 keeps the full size). It needs numpy, scipy, Pillow, and `swiftc` (builds `tiff2heic` on first use).
 The positive is a plain per-channel inversion with gray-world balance. Use the negative TIFF for a
 better conversion. `--start N` continues the numbering for the next tray, `--raw-only` keeps the raw
-passes without cleaning, and `--from-raw DIR` cleans saved raw passes.
+passes without cleaning, `--from-raw DIR` cleans saved raw passes, and `--rotate 35=0` sets the quarter
+turns of a frame (default 1, the film sits sideways; `--reorient DIR` turns finished frames).
 
 **Dust removal.** The infrared pass is not registered to the color pass, and the offset changes
 between scans, so a fixed correction is wrong. `tools/v500clean.py` measures the shift per scan from
-the dust, masks it in the color image, and fills each hole with a biharmonic interpolation plus film
-grain from a clean patch of the same frame. It can run alone:
+the dust and masks it in the color image (weak infrared pixels count when they connect to a strong
+core, which closes gaps in fibers). Each dust region is then filled with a biharmonic interpolation
+plus film grain from a clean patch of the same frame. It can run alone:
 `python3 tools/v500clean.py rgb.tif ir.tif cleaned.tif`.
 
 ## Limits

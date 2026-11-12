@@ -187,8 +187,12 @@ def halve(a):
     return ((acc + 2) >> 2).astype(np.uint16)
 
 
-def process_frame(n, rgb_path, ir_path, out_neg, out_heic, keep_raw, store_dpi=None):
+def process_frame(n, rgb_path, ir_path, out_neg, out_heic, keep_raw, store_dpi=None, rotate=None):
     """Runs in a worker process while the scanner moves on to the next frame."""
+    try:
+        os.nice(10)      # never compete with the USB transfers of the scan running next to it
+    except OSError:
+        pass
     t0 = time.time()
     lines = []
     log = lambda m: lines.append(m)
@@ -202,8 +206,12 @@ def process_frame(n, rgb_path, ir_path, out_neg, out_heic, keep_raw, store_dpi=N
         cleaned = halve(cleaned)
         crop = negpos.CROP // 2
         log('stored at %d dpi (2 x 2 average of the %d dpi scan)' % (RGB_DPI // 2, RGB_DPI))
+    turns = negpos.ROTATE if rotate is None else rotate
+    if turns % 4:
+        # the film sits sideways in the holder: store the negative and the positive upright
+        cleaned = np.ascontiguousarray(np.rot90(cleaned, turns))
     v500clean.write_tiff16(out_neg, cleaned)
-    pos = negpos.convert(cleaned, crop=crop, log=log)
+    pos = negpos.convert(cleaned, crop=crop, rotate=0, log=log)
     del cleaned
     tmp = out_heic + '.tmp.tif'
     v500clean.write_tiff16(tmp, pos, compress=False)
@@ -215,6 +223,39 @@ def process_frame(n, rgb_path, ir_path, out_neg, out_heic, keep_raw, store_dpi=N
         os.remove(ir_path)
     lines.append('done in %.0fs' % (time.time() - t0))
     return n, lines
+
+
+def parse_turns(text):
+    """'35=0,34=2' -> {35: 0, 34: 2}"""
+    out = {}
+    for part in (text or '').split(','):
+        if part.strip():
+            k, v = part.split('=')
+            out[int(k)] = int(v)
+    return out
+
+
+def reorient_dir(folder, turns, default_turn, store_crop):
+    """Rotate finished negatives by quarter turns (counterclockwise, relative) and rebuild their HEICs."""
+    heic_tool()
+    names = sorted(f for f in os.listdir(folder) if re.match(r'frame\d+_negative\.tif$', f))
+    for f in names:
+        n = int(re.match(r'frame(\d+)_', f).group(1))
+        k = turns.get(n, default_turn) % 4
+        path = os.path.join(folder, f)
+        neg = v500clean.read_tiff(path)
+        if k:
+            neg = np.ascontiguousarray(np.rot90(neg, k))
+            tmp = path + '.tmp'
+            v500clean.write_tiff16(tmp, neg)
+            os.replace(tmp, path)
+        pos = negpos.convert(neg, crop=store_crop, rotate=0, log=lambda m: None)
+        out_heic = os.path.join(folder, 'frame%d.heic' % n)
+        tmp = out_heic + '.tmp.tif'
+        v500clean.write_tiff16(tmp, pos, compress=False)
+        subprocess.run([heic_tool(), tmp, out_heic, '0.9'], check=True, capture_output=True)
+        os.remove(tmp)
+        say('frame %d: turned %d x 90 degrees, %dx%d' % (n, k, neg.shape[1], neg.shape[0]))
 
 
 def heic_tool():
@@ -242,11 +283,18 @@ def main():
     ap.add_argument('--store-dpi', type=int, choices=(3200, 6400), default=STORE_DPI, help='resolution of the stored negative and HEIC (default %d)' % STORE_DPI)
     ap.add_argument('--start', type=int, default=1, help='number of the first frame, to continue the numbering across trays of one roll')
     ap.add_argument('--workers', type=int, default=2, help='frames cleaned at the same time while the scanner moves on (default 2)')
+    ap.add_argument('--rotate', default='', help='quarter turns counterclockwise per frame, for example 35=0,34=2 (default 1 for every frame: the film sits sideways in the holder)')
+    ap.add_argument('--reorient', metavar='DIR', help='turn finished negatives in DIR and rebuild their HEICs; --rotate is then relative')
+    ap.add_argument('--turn-default', type=int, default=1, help='relative turns for frames not named in --rotate when using --reorient (default 1)')
     ap.add_argument('--film-type', default=FILM_TYPE)
     ap.add_argument('--frames', help='manual areas in mm as x,y,w,h;x,y,w,h (skips detection)')
     a = ap.parse_args()
     FILM_TYPE = a.film_type
 
+    rot_map = parse_turns(a.rotate)
+    if a.reorient:
+        reorient_dir(os.path.abspath(a.reorient), rot_map, a.turn_default, negpos.CROP // (2 if a.store_dpi != RGB_DPI else 1))
+        return
     if a.from_raw:
         src = os.path.abspath(a.from_raw)
         out = os.path.abspath(a.out or src)
@@ -259,7 +307,7 @@ def main():
             say('frame %d ...' % n)
             _, lines = process_frame(
                 n, os.path.join(src, 'frame%d_rgb_raw.tif' % n), os.path.join(src, 'frame%d_ir_raw.tif' % n),
-                os.path.join(out, 'frame%d_negative.tif' % n), os.path.join(out, 'frame%d.heic' % n), True, a.store_dpi)
+                os.path.join(out, 'frame%d_negative.tif' % n), os.path.join(out, 'frame%d.heic' % n), True, a.store_dpi, rot_map.get(n))
             for l in lines:
                 say('  ' + l)
         say('done: %s' % out)
@@ -321,7 +369,7 @@ def main():
         say('  infrared %.0fs; cleaning in the background' % dt)
         futures.append(pool.submit(
             process_frame, n, rgb_path, ir_path,
-            os.path.join(out, 'frame%d_negative.tif' % n), os.path.join(out, 'frame%d.heic' % n), a.keep_raw, a.store_dpi))
+            os.path.join(out, 'frame%d_negative.tif' % n), os.path.join(out, 'frame%d.heic' % n), a.keep_raw, a.store_dpi, rot_map.get(n)))
         for fut in [x for x in futures if x.done()]:
             futures.remove(fut)
             report(fut)
