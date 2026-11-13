@@ -53,17 +53,24 @@ For each frame the tool scans a 6400 dpi color pass and a 3200 x 2400 dpi infrar
 `frameN.heic` (10-bit sRGB, upright) to `scans/<date>_<time>/`. Cleaning runs at 6400 dpi, then the
 files are averaged 2 x 2 to 3200 dpi (about 57 MB per negative, 5 MB per HEIC; `--store-dpi 6400`
 keeps the full size). It needs numpy, scipy, Pillow, and `swiftc` (builds `tiff2heic` on first use).
-The positive is a plain per-channel inversion with gray-world balance. Use the negative TIFF for a
-better conversion. `--start N` continues the numbering for the next tray, `--raw-only` keeps the raw
-passes without cleaning, `--from-raw DIR` cleans saved raw passes, and `--rotate 35=0` sets the quarter
-turns of a frame (default 1, the film sits sideways; `--reorient DIR` turns finished frames).
+The HEIC is an automatic conversion (`tools/negpos.py`, settings written to `frameN.recipe.json`); edit
+the negative TIFF for a different look. `--start N` continues the numbering for the next tray,
+`--raw-only` keeps the raw passes without cleaning, `--from-raw DIR` cleans saved raw passes,
+`--rotate 35=0` sets the quarter turns of a frame (default 1, the film sits sideways), and
+`--reorient DIR` turns finished frames in seconds without cleaning again.
 
 **Dust removal.** The infrared pass is not registered to the color pass, and the offset changes
-between scans, so a fixed correction is wrong. `tools/v500clean.py` measures the shift per scan from
-the dust and masks it in the color image (weak infrared pixels count when they connect to a strong
-core, which closes gaps in fibers). Each dust region is then filled with a biharmonic interpolation
-plus film grain from a clean patch of the same frame. It can run alone:
-`python3 tools/v500clean.py rgb.tif ir.tif cleaned.tif`.
+between scans and across the frame. `tools/v500clean.py` fits the shift per scan from the dust (an
+affine fit over a grid of tiles plus a smooth local correction) and reports how well the infrared
+dust lines up with dark spots in the color image (a `registration check` line, warning below 15%).
+The mask is the infrared dust map with hysteresis, grown around strong dust and along hairs that
+both sensors see. A region is kept only when the color image shows it, and weak infrared alone
+(below 6 sigma) is not enough, because dense detail such as teeth looks like dust there. Each
+region is filled by a biharmonic solve from smoothed boundary pixels, plus film grain from a clean
+patch. It can run alone: `python3 tools/v500clean.py rgb.tif ir.tif cleaned.tif`.
+
+Frame detection keeps a frame cut by the end of the film run (the top of the window) when at least
+60% of it is visible.
 
 ## Limits
 

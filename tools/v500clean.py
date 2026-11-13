@@ -157,7 +157,7 @@ def estimate_registration(res, mask_y, mask_x, search_y, search_x):
     return best
 
 
-def diffusion_base(out, known, ya, yb, xa, xb, order=2, target=None):
+def diffusion_base(out, known, ya, yb, xa, xb, order=2, target=None, values=None):
     """Solve the harmonic (order 1) or biharmonic (order 2) equation for every unknown pixel of the
     window [ya:yb, xa:xb] with the known pixels as boundary data. The biharmonic solution continues
     edges across the hole with matching slope but can overshoot, the harmonic one never leaves the
@@ -195,22 +195,46 @@ def diffusion_base(out, known, ya, yb, xa, xb, order=2, target=None):
         isu = j >= 0
         rows.append(np.nonzero(isu)[0]); cols.append(j[isu]); vals.append(np.full(int(isu.sum()), c))
         kn = ~isu
-        rhs[kn] -= c * out[qy[kn] + ya, qx[kn] + xa]
+        rhs[kn] -= c * (values[qy[kn], qx[kn]] if values is not None else out[qy[kn] + ya, qx[kn] + xa])
     A = sparse.csc_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(n, n))
     return unk, splu(A).solve(rhs)
 
 
 GRAIN_SIGMA = 3.0
+BOUNDARY_SMOOTH = 2.5
 BIH_LIMIT = 0.15
+
+
+def line_response(dm, length=9, orientations=8):
+    """Maximum over orientations of the mean of dm along a short line. Thin continuous dust (hairs,
+    scratches) keeps its contrast in this response while uncorrelated noise averages down."""
+    best = None
+    c = length // 2
+    for a in range(orientations):
+        th = np.pi * a / orientations
+        k = np.zeros((length, length), np.float32)
+        for t in np.linspace(-c, c, 4 * length):
+            k[int(round(c + t * np.sin(th))), int(round(c + t * np.cos(th)))] = 1.0
+        k /= k.sum()
+        r = ndi.convolve(dm, k, mode='nearest')
+        best = r if best is None else np.maximum(best, r)
+    return best
 
 
 def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log=print,
           strong_sigma=15.0, grow_strong=9, regrow=False, regrow_k=2.5, regrow_dist=12,
-          local_reg=False, local_reg_range=4, local_reg_min_px=150, low_sigma=2.5, visible_min=None, grain=True, final_clip=True):
+          local_reg=False, local_reg_range=4, local_reg_min_px=150, low_sigma=2.5, agree_grow=True, agree_ir=1.2, agree_rgb=4.0, agree_dist=25, thin_grow=False, thin_size=21, thin_k=6.0, thin_dist=60, thin_reach=14, line_filter=False, line_core=4.5, line_low=3.0, visible_min=None, vis_gate=5.0, ir_gate=6.0, dip_size=21, grain=True, final_clip=True):
     H, W = rgb.shape[:2]
     rgb = rgb.astype(np.float32)
     ir = ir.astype(np.float32)
+    # the infrared pixel grid is 2 x 8/3 times coarser than the color grid (3200 x 2400 dpi against 6400 dpi).
+    # The color width is rounded down to a multiple of 8, so the ratio of the image sizes is slightly off;
+    # use the exact factors whenever the sizes agree with them.
     sy, sx = H / ir.shape[0], W / ir.shape[1]
+    if abs(sy - 8 / 3) < 0.02 * 8 / 3:
+        sy = 8 / 3
+    if abs(sx - 2.0) < 0.02 * 2.0:
+        sx = 2.0
 
     # dust map at the infrared resolution
     t0 = time.time()
@@ -227,6 +251,19 @@ def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log
         keep[0] = False
         strong_core = keep[lab]
         del lab
+    if line_filter:
+        lr = line_response(dm)
+        sig_l = 1.4826 * np.median(np.abs(lr - np.median(lr)))
+        lcore = lr > line_core * sig_l
+        llow = lr > line_low * sig_l
+        lab, nlab = ndi.label(llow | strong_core, structure=np.ones((3, 3)))
+        keep = np.zeros(nlab + 1, bool)
+        keep[np.unique(lab[lcore | strong_core])] = True
+        keep[0] = False
+        extra = keep[lab] & llow
+        log('line filter adds %d px to the infrared mask' % int((extra & ~strong_core).sum()))
+        strong_core = strong_core | extra
+        del lab, lr
     m_native = ndi.binary_dilation(strong_core, iterations=1)
     log('infrared mask: %d px at %dx%d (%.1fs)' % (m_native.sum(), ir.shape[1], ir.shape[0], time.time() - t0))
     ys, xs = np.nonzero(m_native)
@@ -247,33 +284,114 @@ def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log
     res /= res.std()
     del gl
     if shift is None:
-        # estimate the shift in vertical bands and fit a line, since the offset drifts along the scan
-        nb = 8
-        edges = np.linspace(0, H, nb + 1).astype(int)
+        # estimate the shift on a grid of tiles and fit an affine model, because the offset drifts along the
+        # scan and can also change across the width (a scale mismatch between the two passes)
+        nby, nbx = 8, 3
+        ye = np.linspace(0, H, nby + 1).astype(int)
+        xe = np.linspace(0, W, nbx + 1).astype(int)
         pts = []
-        for k in range(nb):
-            sel = (sy_s >= edges[k]) & (sy_s < edges[k + 1])
-            if sel.sum() >= 300:
-                sc, dyb, dxb = estimate_registration(res, sy_s[sel], sx_s[sel], 30, 14)
-                if sc < -0.3:
-                    pts.append(((edges[k] + edges[k + 1]) / 2, dyb, dxb, sc))
+        for i in range(nby):
+            for j in range(nbx):
+                sel = (sy_s >= ye[i]) & (sy_s < ye[i + 1]) & (sx_s >= xe[j]) & (sx_s < xe[j + 1])
+                if sel.sum() >= 300:
+                    sc, dyb, dxb = estimate_registration(res, sy_s[sel], sx_s[sel], 30, 26)
+                    if sc < -0.3:
+                        pts.append(((ye[i] + ye[i + 1]) / 2, (xe[j] + xe[j + 1]) / 2, dyb, dxb, sc))
         if not pts:
             log('warning: not enough dust to register the infrared pass, frame left uncleaned')
             return np.clip(np.rint(rgb), 0, 65535).astype(np.uint16), np.zeros((H, W), bool), None
-        yc = np.array([p[0] for p in pts]); wt = np.array([-p[3] for p in pts])
-        if len(pts) == 1:
-            fit_dy = np.array([0.0, float(pts[0][1])]); fit_dx = np.array([0.0, float(pts[0][2])])
+        P = np.array(pts)
+        wt = np.minimum(-P[:, 4], 1.5)       # a few very strong features must not outvote the rest
+        med = np.median(P[:, 2:4], axis=0)
+        keep = np.hypot(P[:, 2] - med[0], P[:, 3] - med[1]) < 12.0
+        if keep.sum() < 3:
+            keep = np.ones(len(P), bool)
+
+        def fit(keep):
+            if keep.sum() >= 4:
+                A = np.stack([np.ones(keep.sum()), P[keep, 0] / H, P[keep, 1] / W], 1)
+            else:
+                A = np.ones((keep.sum(), 1))
+            sw = np.sqrt(wt[keep])[:, None]
+            cy = np.linalg.lstsq(A * sw, P[keep, 2] * sw[:, 0], rcond=None)[0]
+            cx = np.linalg.lstsq(A * sw, P[keep, 3] * sw[:, 0], rcond=None)[0]
+            return cy, cx
+
+        def predict(c, y, x):
+            if len(c) == 3:
+                return c[0] + c[1] * y / H + c[2] * x / W
+            return np.full_like(np.asarray(y, dtype=float), c[0])
+
+        for _ in range(3):
+            cy, cx = fit(keep)
+            ry = P[:, 2] - predict(cy, P[:, 0], P[:, 1])
+            rx = P[:, 3] - predict(cx, P[:, 0], P[:, 1])
+            bad = np.hypot(ry, rx)
+            thr_bad = max(3.0, 2.5 * 1.4826 * np.median(bad[keep]))
+            new_keep = bad <= thr_bad
+            if new_keep.sum() < 4 or (new_keep == keep).all():
+                break
+            keep = new_keep
+        cy, cx = fit(keep)
+        log('registration tiles (row, col, dy, dx, score): %s' % [(int(p[0]), int(p[1]), int(p[2]), int(p[3]), round(p[4], 2)) for p in P])
+        c6 = (cy[0], cy[1], cy[2], cx[0], cx[1], cx[2]) if len(cy) == 3 else (cy[0], 0.0, 0.0, cx[0], 0.0, 0.0)
+        log('registration model: dy = %.1f %+.1f*y/H %+.1f*x/W, dx = %.1f %+.1f*y/H %+.1f*x/W (%d of %d tiles used)'
+            % (c6 + (int(keep.sum()), len(P))))
+        # local correction: shifts estimated on a finer grid around the affine prediction, smoothed, and
+        # interpolated, so that slowly varying local distortion between the two passes is followed too
+        tile = 400
+        gy, gx = -(-H // tile), -(-W // tile)
+        fy = np.zeros((gy, gx)); fx = np.zeros((gy, gx)); fw = np.zeros((gy, gx))
+        pdy = predict(cy, sy_s, sx_s); pdx = predict(cx, sy_s, sx_s)
+        ty = np.minimum(sy_s // tile, gy - 1); tx = np.minimum(sx_s // tile, gx - 1)
+        tid = ty * gx + tx
+        order = np.argsort(tid, kind='stable')
+        tid_sorted = tid[order]
+        bounds = np.searchsorted(tid_sorted, np.arange(gy * gx + 1))
+        used = 0
+        for t in range(gy * gx):
+            idx = order[bounds[t]:bounds[t + 1]]
+            if len(idx) < 150:
+                continue
+            py_, px_ = sy_s[idx] - np.rint(pdy[idx]).astype(np.int64), sx_s[idx] - np.rint(pdx[idx]).astype(np.int64)
+            best = (None, 0, 0)
+            zero = None
+            for dy in range(-8, 9):
+                qy = py_ - dy
+                oky = (qy >= 0) & (qy < H)
+                for dx in range(-8, 9):
+                    qx = px_ - dx
+                    ok = oky & (qx >= 0) & (qx < W)
+                    if ok.sum() < 100:
+                        continue
+                    v_ = float(res[qy[ok], qx[ok]].mean())
+                    if dy == 0 and dx == 0:
+                        zero = v_
+                    if best[0] is None or v_ < best[0]:
+                        best = (v_, dy, dx)
+            if best[0] is not None and zero is not None and best[0] < -0.3 and best[0] < zero - 0.1:
+                fy[t // gx, t % gx] = best[1]; fx[t // gx, t % gx] = best[2]; fw[t // gx, t % gx] = min(-best[0], 1.5)
+                used += 1
+        if used >= 3:
+            den = ndi.gaussian_filter(fw, 1.0)
+            fy_s = np.where(den > 1e-3, ndi.gaussian_filter(fy * fw, 1.0) / np.maximum(den, 1e-3), 0.0)
+            fx_s = np.where(den > 1e-3, ndi.gaussian_filter(fx * fw, 1.0) / np.maximum(den, 1e-3), 0.0)
+            # tiles far from any measurement fall back to the affine model
+            conf = np.clip(den / 0.3, 0, 1)
+            fy_s *= conf; fx_s *= conf
+            log('local correction from %d of %d tiles, largest %.1f px' % (used, gy * gx, float(np.hypot(fy_s, fx_s).max())))
         else:
-            fit_dy = np.polyfit(yc, [p[1] for p in pts], 1, w=wt)
-            fit_dx = np.polyfit(yc, [p[2] for p in pts], 1, w=wt)
-        log('registration (RGB px) per band: %s' % [(int(p[0]), p[1], p[2], round(p[3], 2)) for p in pts])
-        log('registration model: dy = %.2f + %.5f*y, dx = %.2f + %.5f*y' % (
-            fit_dy[1], fit_dy[0], fit_dx[1], fit_dx[0]))
-        reg = lambda y: (np.rint(np.polyval(fit_dy, y)).astype(np.int64), np.rint(np.polyval(fit_dx, y)).astype(np.int64))
+            fy_s = np.zeros((gy, gx)); fx_s = np.zeros((gy, gx))
+
+        def reg(y, x):
+            c = (np.asarray(y, dtype=float) / tile - 0.5, np.asarray(x, dtype=float) / tile - 0.5)
+            ly = ndi.map_coordinates(fy_s, c, order=1, mode='nearest')
+            lx = ndi.map_coordinates(fx_s, c, order=1, mode='nearest')
+            return (np.rint(predict(cy, y, x) + ly).astype(np.int64), np.rint(predict(cx, y, x) + lx).astype(np.int64))
         log('(%.1fs)' % (time.time() - t0))
     else:
         log('registration forced: dy,dx = %d,%d' % shift)
-        reg = lambda y: (np.full_like(y, shift[0]), np.full_like(y, shift[1]))
+        reg = lambda y, x: (np.full_like(y, shift[0]), np.full_like(y, shift[1]))
 
     # masks on the RGB grid, shifted to the RGB features. Strong infrared dust (an opaque fiber or
     # speck) scatters light around itself, so its halo is wider than its infrared footprint and gets
@@ -283,7 +401,7 @@ def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log
             up = ndi.zoom(m_ir.astype(np.float32), (sy, sx), order=1)[:H, :W] > 0.3
             out_mask = np.zeros((H, W), bool)
             yy, xx = np.nonzero(up)
-            dyr, dxr = reg(yy)
+            dyr, dxr = reg(yy, xx)
             out_mask[np.clip(yy - dyr, 0, H - 1), np.clip(xx - dxr, 0, W - 1)] = True
             return out_mask
         # each large component is re-registered on its own within a few pixels of the fitted model
@@ -297,7 +415,7 @@ def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log
             yy, xx = np.nonzero(labup[sl] == k)
             yy = yy + sl[0].start
             xx = xx + sl[1].start
-            dyr, dxr = reg(yy)
+            dyr, dxr = reg(yy, xx)
             by, bx = yy - dyr, xx - dxr
             dyk = dxk = 0
             if len(yy) >= local_reg_min_px:
@@ -340,7 +458,83 @@ def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log
         log('region growing: mask %d -> %d px' % (before, int(mask.sum())))
         del lum, ref, rr, cand, near
     del res
+    extra_strong = None
+    if agree_grow:
+        # two-sensor agreement: pixels near a detected region are added when the infrared is at least weakly
+        # positive there AND the color image is clearly darker (in the negative) than its surroundings. This
+        # recovers the tails of thin hairs whose infrared contrast dips, without adding image structure
+        # (which fails the infrared test) or infrared noise (which fails the color test).
+        lum = rgb.mean(2)
+        known0 = ~ndi.binary_dilation(mask, iterations=6)
+        kf = known0.astype(np.float32)
+        ref = ndi.gaussian_filter(lum * kf, 10) / np.maximum(ndi.gaussian_filter(kf, 10), 1e-3)
+        rr = ndi.gaussian_filter(lum - ref, 1.0)
+        sample = rr[::7, ::7][known0[::7, ::7]]
+        sig_n = 1.4826 * np.median(np.abs(sample - np.median(sample)))
+        # local dip depth: how far a pixel lies below the grey closing of its surroundings. Dust is narrower
+        # than dip_size and shows as a dip; image structure wider than that (teeth, eyes, a face against its
+        # background) has no dip inside it, so it cannot pass for dust.
+        # (measured on log luminance, which is the contrast the positive shows, and normalized by the local
+        # noise of that dip so that grainy dense areas do not look like dust)
+        lg = np.log(np.maximum(lum, 1.0))
+        dip = ndi.grey_closing(lg, size=(dip_size, dip_size)) - lg
+        blk = 96
+        hb, wb = H // blk, W // blk
+        cut = dip[:hb * blk, :wb * blk].reshape(hb, blk, wb, blk)[:, ::3, :, ::3]
+        bm = np.median(cut, axis=(1, 3))
+        bs = 1.4826 * np.median(np.abs(cut - bm[:, None, :, None]), axis=(1, 3)) + 1e-4
+        bm = ndi.zoom(bm, (H / hb, W / wb), order=1, mode='nearest')[:H, :W]
+        bs = ndi.zoom(bs, (H / hb, W / wb), order=1, mode='nearest')[:H, :W]
+        rrd = -(ndi.gaussian_filter(dip, 1.0) - bm) / bs
+        sig_d = 1.0
+        del dip, bm, bs, cut, lg
+        # alignment self-check: after registration the infrared dust should be dark in the color image
+        agree = float((rr[mask] < -2.0 * sig_n).mean()) if mask.any() else 0.0
+        log('registration check: %.0f%% of the infrared dust pixels are clearly dark in the color image%s' % (
+            100 * agree, '' if agree >= 0.15 else ' (LOW: the alignment may be poor)'))
+        if vis_gate is not None and mask.any():
+            # visibility gate: a detected region is kept only when the color image shows it (peak darkness of
+            # at least vis_gate times the grain) or when the infrared is strong. Weak infrared blips on dense
+            # image areas (teeth, bright eyes) are not dust: filling them removes real detail.
+            labm, nm = ndi.label(mask, structure=np.ones((3, 3)))
+            idxm = np.arange(1, nm + 1)
+            dark = -np.asarray(ndi.minimum(rrd, labm, idxm)) / sig_d
+            has_strong = np.asarray(ndi.maximum(to_rgb_grid(dm > strong_sigma * sig).astype(np.uint8), labm, idxm)) > 0
+            # a region whose infrared never exceeds ir_gate sigma is at the noise level of the dust map: the
+            # color image must not be the only evidence, because a dip in dense detail (the gap between two
+            # teeth) looks like dust there (frame 22)
+            has_ir = np.asarray(ndi.maximum(to_rgb_grid(dm > ir_gate * sig).astype(np.uint8), labm, idxm)) > 0
+            keep_c = np.concatenate([[False], ((dark >= vis_gate) & has_ir) | has_strong])
+            log('visibility gate: dropped %d of %d regions that the color image does not show' % (int((~keep_c[1:]).sum()), nm))
+            mask = keep_c[labm] & mask
+            del labm
+        weak = to_rgb_grid(ndi.binary_dilation(dm > agree_ir * sig, iterations=1))
+        near = ndi.maximum_filter(mask.astype(np.uint8), size=2 * agree_dist + 1).astype(bool)
+        cand = weak & near & (rrd < -agree_rgb * sig_d)
+        before = int(mask.sum())
+        mask0 = mask
+        mask = ndi.binary_propagation(ndi.binary_dilation(mask, iterations=2), mask=cand | mask, structure=np.ones((3, 3), bool))
+        extra_strong = mask & ~mask0
+        log('two-sensor growing: mask %d -> %d px' % (before, int(mask.sum())))
+        del lum, ref, rr, rrd, cand, near, weak, kf, known0
+    if thin_grow:
+        # thin dark structures of the negative (dust, hairs, scratches) that touch a detected region are added
+        # to it: where the infrared contrast of a thin hair dips, the color image still shows it clearly
+        lum = rgb.mean(2)
+        th = ndi.grey_closing(lum, size=(thin_size, thin_size)) - lum
+        sample = th[::5, ::5]
+        sig_t = 1.4826 * np.median(np.abs(sample - np.median(sample)))
+        cand = th > np.median(sample) + thin_k * sig_t
+        near = ndi.maximum_filter(mask.astype(np.uint8), size=2 * thin_dist + 1).astype(bool)
+        cand &= near
+        before = int(mask.sum())
+        mask = ndi.binary_propagation(ndi.binary_dilation(mask, iterations=thin_reach), mask=cand | mask, structure=np.ones((3, 3), bool))
+        log('thin structure growing: mask %d -> %d px' % (before, int(mask.sum())))
+        del lum, th, cand, near, sample
     omega = ndi.binary_dilation(mask, iterations=grow)
+    if extra_strong is not None and extra_strong.any():
+        # pixels that the color image shows clearly get the wide growth of strong dust (their halo is wide too)
+        omega |= ndi.binary_dilation(extra_strong, iterations=grow_strong)
     m_strong = ndi.binary_dilation(dm > strong_sigma * sig, iterations=1)
     if m_strong.any():
         omega |= ndi.binary_dilation(to_rgb_grid(m_strong), iterations=grow_strong)
@@ -398,8 +592,15 @@ def clean(rgb, ir, grow=4, thr=4.0, cell=24, ncand=1500, ring=3, shift=None, log
             if not comp.any():
                 continue
             wk = kb[ya:yb, xa:xb]
-            sol2 = diffusion_base(out, kb, ya, yb, xa, xb, order=2, target=comp)
-            sol1 = diffusion_base(out, kb, ya, yb, xa, xb, order=1, target=comp)
+            # boundary data: the known pixels around the region, lightly smoothed so that their grain and
+            # chroma noise is not interpolated into smooth colored blobs inside the region
+            wvals = out[ya:yb, xa:xb].astype(np.float32).copy()
+            kf_w = wk.astype(np.float32)
+            den_w = np.maximum(ndi.gaussian_filter(kf_w, BOUNDARY_SMOOTH), 1e-3)
+            for c_ in range(3):
+                wvals[..., c_] = np.where(wk, ndi.gaussian_filter(wvals[..., c_] * kf_w, BOUNDARY_SMOOTH) / den_w, wvals[..., c_])
+            sol2 = diffusion_base(out, kb, ya, yb, xa, xb, order=2, target=comp, values=wvals)
+            sol1 = diffusion_base(out, kb, ya, yb, xa, xb, order=1, target=comp, values=wvals)
             tgt = out[ya:yb, xa:xb]
             if sol1 is not None and sol2 is not None:
                 unk_mask, v1 = sol1

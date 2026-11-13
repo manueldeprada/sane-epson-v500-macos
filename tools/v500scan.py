@@ -21,8 +21,10 @@ choose the output folder (default ./scans).
 import argparse
 import concurrent.futures as cf
 import datetime
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -140,18 +142,22 @@ def detect_frames(prev, dpi=PREVIEW_DPI):
                 best = (sc, ph)
         score, phase = best
         gap = GAP_MM * px
-        k0 = -1
+        # a frame cut by the film run's end (top of the window, or the strip's tail) is kept when at
+        # least 60% of it is inside the run; its box is clipped to the run
+        full = pitch - gap
+        k0 = -2
         while True:
             top = r0 + phase + k0 * pitch + gap / 2
             bot = r0 + phase + (k0 + 1) * pitch - gap / 2
-            if bot > r1 + 4:
+            if top > r1:
                 break
-            if top >= r0 - 4:
+            ctop, cbot = max(top, r0), min(bot, r1)
+            if cbot - ctop >= 0.6 * full:
                 frames.append({
                     'x_mm': (cc0 - (0.08 * (c1 - c0)) + inset) / px,
-                    'y_mm': top / px,
+                    'y_mm': ctop / px,
                     'w_mm': ((c1 - c0) - 2 * inset) / px,
-                    'h_mm': (bot - top) / px,
+                    'h_mm': (cbot - ctop) / px,
                     'phase_score': float(score),
                     'window': (c0, c1),
                 })
@@ -211,18 +217,55 @@ def process_frame(n, rgb_path, ir_path, out_neg, out_heic, keep_raw, store_dpi=N
         # the film sits sideways in the holder: store the negative and the positive upright
         cleaned = np.ascontiguousarray(np.rot90(cleaned, turns))
     v500clean.write_tiff16(out_neg, cleaned)
-    pos = negpos.convert(cleaned, crop=crop, rotate=0, log=log)
+    recipe = measure_color(cleaned, out_neg, crop)
+    negpos.recipe_to_json(recipe, recipe_path(out_neg), os.path.basename(out_neg))
+    log('  ' + negpos.describe(recipe))
+    for warning in recipe.get('warnings', []):
+        log('  color: ' + warning)
+    pos = negpos.apply(cleaned, recipe)
     del cleaned
-    tmp = out_heic + '.tmp.tif'
-    v500clean.write_tiff16(tmp, pos, compress=False)
+    write_heic(pos, out_heic)
     del pos
-    subprocess.run([heic_tool(), tmp, out_heic, '0.9'], check=True, capture_output=True)
-    os.remove(tmp)
     if not keep_raw:
         os.remove(rgb_path)
         os.remove(ir_path)
     lines.append('done in %.0fs' % (time.time() - t0))
     return n, lines
+
+
+def recipe_path(negative_path):
+    return negative_path.replace('_negative.tif', '.recipe.json')
+
+
+def measure_color(negative, negative_path, crop):
+    """Use a roll's shared channel calibration when one has been saved beside its negatives."""
+    profile_path = os.path.join(os.path.dirname(negative_path), 'color-profile.json')
+    profile = {}
+    if os.path.exists(profile_path):
+        with open(profile_path) as f:
+            profile = json.load(f)
+    controls = {key: profile[key] for key in ('k', 'channel_ratios', 'wb_prior', 'wb_prior_limit', 'hue_adjustments', 'tone_contrast', 'contrast_pivot', 'shoulder', 'shoulder_model') if key in profile}
+    recipe = negpos.measure(negative, crop=crop, **controls)
+    if profile:
+        recipe['profile_name'] = profile.get('name', 'color-profile.json')
+    return recipe
+
+
+def write_recipes(folder, store_crop):
+    """Write frameN.recipe.json for every finished negative in a folder (no pixels change)."""
+    for f in sorted(os.listdir(folder)):
+        m = re.match(r'frame(\d+)_negative\.tif$', f)
+        if m:
+            path = os.path.join(folder, f)
+            if os.path.exists(recipe_path(path)):
+                say('frame %s: kept existing recipe' % m.group(1))
+                continue
+            if os.path.exists(os.path.join(folder, 'frame%s.heic' % m.group(1))):
+                say('frame %s: cannot infer the recipe of an existing HEIC; render from the negative instead' % m.group(1))
+                continue
+            recipe = measure_color(v500clean.read_tiff(path), path, store_crop)
+            negpos.recipe_to_json(recipe, recipe_path(path), f)
+            say('frame %s: %s' % (m.group(1), os.path.basename(recipe_path(path))))
 
 
 def parse_turns(text):
@@ -237,7 +280,7 @@ def parse_turns(text):
 
 def reorient_dir(folder, turns, default_turn, store_crop):
     """Rotate finished negatives by quarter turns (counterclockwise, relative) and rebuild their HEICs."""
-    heic_tool()
+    prepare_heic()
     names = sorted(f for f in os.listdir(folder) if re.match(r'frame\d+_negative\.tif$', f))
     for f in names:
         n = int(re.match(r'frame(\d+)_', f).group(1))
@@ -249,13 +292,38 @@ def reorient_dir(folder, turns, default_turn, store_crop):
             tmp = path + '.tmp'
             v500clean.write_tiff16(tmp, neg)
             os.replace(tmp, path)
-        pos = negpos.convert(neg, crop=store_crop, rotate=0, log=lambda m: None)
+        # Existing color choices survive an orientation change. A recipe contains measured
+        # gains, so its optional neutral rectangles do not need to be sampled again.
+        sidecar = recipe_path(path)
+        if os.path.exists(sidecar):
+            with open(sidecar) as src:
+                recipe = json.load(src)
+        else:
+            recipe = measure_color(neg, path, store_crop)
+        negpos.recipe_to_json(recipe, recipe_path(path), f)
+        pos = negpos.apply(neg, recipe)
         out_heic = os.path.join(folder, 'frame%d.heic' % n)
-        tmp = out_heic + '.tmp.tif'
-        v500clean.write_tiff16(tmp, pos, compress=False)
-        subprocess.run([heic_tool(), tmp, out_heic, '0.9'], check=True, capture_output=True)
-        os.remove(tmp)
+        write_heic(pos, out_heic)
         say('frame %d: turned %d x 90 degrees, %dx%d' % (n, k, neg.shape[1], neg.shape[0]))
+
+
+def prepare_heic():
+    if not shutil.which('ffmpeg'):
+        heic_tool()
+
+
+def write_heic(positive, destination):
+    if shutil.which('ffmpeg'):
+        import heic_cpu
+        heic_cpu.encode_rgb(positive, destination)
+        return
+    temporary = destination + '.tmp.tif'
+    try:
+        v500clean.write_tiff16(temporary, positive, compress=False)
+        subprocess.run([heic_tool(), temporary, destination, '0.9'], check=True, capture_output=True)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
 
 
 def heic_tool():
@@ -274,7 +342,7 @@ FILM_TYPE = 'Negative Film'
 def main():
     global FILM_TYPE
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('-o', '--out', help='output folder (default: scans/<date>_<time>)')
+    ap.add_argument('-o', '--out', help='output folder (default: scans/<date>_<time> next to the project)')
     ap.add_argument('--list', action='store_true', help='preview and detect frames, then stop')
     ap.add_argument('--only', help='comma-separated frame numbers to scan, for example 2,3')
     ap.add_argument('--keep-raw', action='store_true', help='keep the raw RGB and infrared TIFFs')
@@ -286,12 +354,16 @@ def main():
     ap.add_argument('--rotate', default='', help='quarter turns counterclockwise per frame, for example 35=0,34=2 (default 1 for every frame: the film sits sideways in the holder)')
     ap.add_argument('--reorient', metavar='DIR', help='turn finished negatives in DIR and rebuild their HEICs; --rotate is then relative')
     ap.add_argument('--turn-default', type=int, default=1, help='relative turns for frames not named in --rotate when using --reorient (default 1)')
+    ap.add_argument('--recipes', metavar='DIR', help='write frameN.recipe.json (the negative to positive settings) for the finished negatives in DIR')
     ap.add_argument('--film-type', default=FILM_TYPE)
     ap.add_argument('--frames', help='manual areas in mm as x,y,w,h;x,y,w,h (skips detection)')
     a = ap.parse_args()
     FILM_TYPE = a.film_type
 
     rot_map = parse_turns(a.rotate)
+    if a.recipes:
+        write_recipes(os.path.abspath(a.recipes), negpos.CROP // (2 if a.store_dpi != RGB_DPI else 1))
+        return
     if a.reorient:
         reorient_dir(os.path.abspath(a.reorient), rot_map, a.turn_default, negpos.CROP // (2 if a.store_dpi != RGB_DPI else 1))
         return
@@ -299,7 +371,7 @@ def main():
         src = os.path.abspath(a.from_raw)
         out = os.path.abspath(a.out or src)
         os.makedirs(out, exist_ok=True)
-        heic_tool()
+        prepare_heic()
         nums = sorted(int(m.group(1)) for f in os.listdir(src) for m in [re.match(r'frame(\d+)_rgb_raw\.tif$', f)] if m)
         if a.only:
             nums = [n for n in nums if n in {int(v) for v in a.only.split(',')}]
@@ -316,7 +388,7 @@ def main():
     out = a.out or os.path.join(OUT_ROOT, datetime.datetime.now().strftime('%Y-%m-%d_%H%M'))
     out = os.path.abspath(out)
     os.makedirs(out, exist_ok=True)
-    heic_tool()
+    prepare_heic()
 
     # preview
     prev_tif = os.path.join(out, 'preview.tif')
